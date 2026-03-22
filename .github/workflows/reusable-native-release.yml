@@ -1,0 +1,123 @@
+name: Native Release (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      binary-name:
+        required: true
+        type: string
+        description: 'Base binary name used when uploading artifacts in the build workflow'
+      version:
+        required: true
+        type: string
+        description: 'Release version string, e.g. 1.2.3'
+      tag-name:
+        required: false
+        type: string
+        default: ''
+        description: 'Git tag to attach the release to. Defaults to the tag that triggered the workflow.'
+      release-name:
+        required: false
+        type: string
+        default: ''
+        description: 'Release title. Defaults to "<binary-name> v<version>".'
+      prerelease:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.binary-name }}-*
+          path: ./artifacts
+          merge-multiple: false
+
+      - name: Collect release assets
+        run: |
+          mkdir -p ./release-assets
+          find ./artifacts -type f \( -not -name "*.sha256" -o -name "*.sha256" \) \
+            -exec cp {} ./release-assets/ \;
+
+          echo "Release assets:"
+          ls -lh ./release-assets/
+
+      - name: Verify all platforms present
+        run: |
+          MISSING=()
+          for PLATFORM in linux-x64 windows-x64 macos-x64 macos-arm64; do
+            if ! ls ./release-assets/${{ inputs.binary-name }}-${PLATFORM}* 1>/dev/null 2>&1; then
+              MISSING+=("$PLATFORM")
+            fi
+          done
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "Missing binaries for platforms: ${MISSING[*]}"
+            exit 1
+          fi
+
+          echo "All platform binaries present"
+
+      - name: Resolve inputs
+        id: resolve
+        run: |
+          TAG="${{ inputs.tag-name }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
+
+          NAME="${{ inputs.release-name }}"
+          if [ -z "$NAME" ]; then NAME="${{ inputs.binary-name }} v${{ inputs.version }}"; fi
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          NOTES_FILE="release-notes.md"
+
+          echo "## ${{ steps.resolve.outputs.name }}" > "$NOTES_FILE"
+          echo "" >> "$NOTES_FILE"
+          echo "Native binaries built with GraalVM — no JVM required." >> "$NOTES_FILE"
+          echo "" >> "$NOTES_FILE"
+          echo "### Binaries" >> "$NOTES_FILE"
+          echo "" >> "$NOTES_FILE"
+
+          for FILE in ./release-assets/${{ inputs.binary-name }}-*; do
+            [[ "$FILE" == *.sha256 ]] && continue
+            NAME_ONLY=$(basename "$FILE")
+            SIZE=$(du -sh "$FILE" | cut -f1)
+            echo "- \`$NAME_ONLY\` ($SIZE)" >> "$NOTES_FILE"
+          done
+
+          echo "" >> "$NOTES_FILE"
+          echo "### Checksums" >> "$NOTES_FILE"
+          echo "" >> "$NOTES_FILE"
+          echo "\`\`\`" >> "$NOTES_FILE"
+          cat ./release-assets/*.sha256 >> "$NOTES_FILE"
+          echo "\`\`\`" >> "$NOTES_FILE"
+
+          echo "notes-file=$NOTES_FILE" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve.outputs.tag }}
+          name: ${{ steps.resolve.outputs.name }}
+          body_path: ${{ steps.notes.outputs.notes-file }}
+          files: ./release-assets/*
+          prerelease: ${{ inputs.prerelease }}
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

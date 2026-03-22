@@ -1,0 +1,168 @@
+name: Native Build (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      gradle-task:
+        required: true
+        type: string
+        description: 'Gradle task for native compilation, e.g. :myapp:nativeCompile'
+      binary-name:
+        required: true
+        type: string
+        description: 'Base name of the compiled binary, e.g. myapp'
+      binary-dir:
+        required: true
+        type: string
+        description: 'Directory containing the compiled binary, e.g. app/build/native/nativeCompile'
+      java-version:
+        required: false
+        type: string
+        default: '21'
+      graalvm-distribution:
+        required: false
+        type: string
+        default: 'graalvm'
+      gradle-args:
+        required: false
+        type: string
+        default: ''
+        description: 'Extra arguments to pass to Gradle'
+      artifact-retention-days:
+        required: false
+        type: number
+        default: 7
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.caching=true"
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+          - os: windows-latest
+            platform: windows
+            arch: x64
+          - os: macos-latest
+            platform: macos
+            arch: x64
+          - os: macos-14
+            platform: macos
+            arch: arm64
+
+    steps:
+      - name: Configure Git
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@v4
+
+      - name: Set up GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.graalvm-distribution }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          native-image-job-reports: 'true'
+          cache: 'gradle'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: Build native binary
+        run: ./gradlew ${{ inputs.gradle-task }} ${{ inputs.gradle-args }}
+
+      - name: Collect binary
+        id: collect
+        shell: bash
+        run: |
+          SUFFIX=""
+          if [ "${{ matrix.platform }}" = "windows" ]; then SUFFIX=".exe"; fi
+
+          SRC="${{ inputs.binary-dir }}/${{ inputs.binary-name }}${SUFFIX}"
+          DEST="${{ inputs.binary-name }}-${{ matrix.platform }}-${{ matrix.arch }}${SUFFIX}"
+
+          if [ ! -f "$SRC" ]; then
+            echo "Binary not found at: $SRC"
+            find "${{ inputs.binary-dir }}" -type f 2>/dev/null || true
+            exit 1
+          fi
+
+          mkdir -p ./release-assets
+          cp "$SRC" "./release-assets/$DEST"
+
+          SHA=$(sha256sum "./release-assets/$DEST" 2>/dev/null || shasum -a 256 "./release-assets/$DEST")
+          echo "$SHA" > "./release-assets/$DEST.sha256"
+
+          echo "artifact=$DEST" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.binary-name }}-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ./release-assets/*
+          retention-days: ${{ inputs.artifact-retention-days }}
+          if-no-files-found: error
+
+  test:
+    name: Test (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    needs: build
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+          - os: windows-latest
+            platform: windows
+            arch: x64
+          - os: macos-latest
+            platform: macos
+            arch: x64
+          - os: macos-14
+            platform: macos
+            arch: arm64
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.binary-name }}-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ./release-assets
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          cd ./release-assets
+
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            BIN=$(find . -name "*.exe" -not -name "*.sha256" | head -1)
+          else
+            BIN=$(find . -type f -not -name "*.sha256" | head -1)
+            chmod +x "$BIN"
+          fi
+
+          if [ -z "$BIN" ]; then
+            echo "No binary found"
+            exit 1
+          fi
+
+          echo "Running: $BIN --help"
+          "./$BIN" --help || true
